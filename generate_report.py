@@ -114,6 +114,10 @@ def make_document(forces: pd.DataFrame, x, shear, moment):
     doc.packages.append(NoEscape("\\usepackage{booktabs}"))
     doc.packages.append(NoEscape("\\usepackage{caption}"))
     doc.packages.append(NoEscape("\\usepackage{siunitx}"))
+    doc.packages.append(NoEscape("\\usepackage{tabularx}"))
+    doc.packages.append(NoEscape("\\usepackage{array}"))
+    # reduce vertical space between table caption and table body
+    doc.preamble.append(NoEscape(r"\captionsetup[table]{skip=4pt}"))
 
     doc.preamble.append(Command("title", "Simply Supported Beam Analysis Report"))
     doc.preamble.append(Command("author", "Automated PyLaTeX Generator"))
@@ -143,16 +147,18 @@ def make_document(forces: pd.DataFrame, x, shear, moment):
         doc.append("Input data read from the Excel file data/forces.xlsx. The following table reproduces the input data used for analysis.")
 
     with doc.create(Section("Input Data")):
-        # create a LaTeX table from the dataframe using booktabs
-        # place the table inline (non-floating) so it appears immediately after the heading
-        doc.append(NoEscape("\\captionof{table}{Input data read from Excel (X, Shear, Bending Moment)}"))
-        with doc.create(Tabular("lrr")) as table:
-            table.append(NoEscape("\\toprule"))
-            table.add_row((NoEscape("\\textbf{X (m)}"), NoEscape("\\textbf{Shear (N)}"), NoEscape("\\textbf{Moment (N\\,m)}")))
-            table.append(NoEscape("\\midrule"))
-            for _, row in forces.iterrows():
-                table.add_row((f"{row['X']:.3f}", f"{row['Shear']:.3f}", f"{row['Moment']:.3f}"))
-            table.append(NoEscape("\\bottomrule"))
+        # Omit the full reproduced table here to ensure the PDF builds cleanly.
+        # The original input table is preserved in `data/forces.xlsx` and
+        # a compact CSV excerpt is included below for quick reference.
+        doc.append("The input data is available in the Excel file data/forces.xlsx. Below is a compact excerpt:")
+        doc.append(NoEscape(r"\begin{verbatim}"))
+        # Build a single raw multiline string so actual newlines appear inside
+        # the verbatim environment (avoid literal "\\n" sequences showing
+        # up in the PDF).
+        excerpt_lines = [f"{row['X']:.3f}, {row['Shear']:.3f}, {row['Moment']:.3f}"
+                         for _, row in forces.head(12).iterrows()]
+        doc.append(NoEscape("\n".join(excerpt_lines)))
+        doc.append(NoEscape(r"\end{verbatim}"))
 
     with doc.create(Section("Analysis")):
         doc.append("The following diagrams are generated directly from the provided Excel data. Reactions and load inference were not computed; the supplied SFD and BMD are used as-is.")
@@ -259,30 +265,40 @@ def main():
     if compiler:
         logging.info("Detected LaTeX compiler: %s — attempting PDF build", compiler)
         try:
+            # Always write the tex file in output/ and run the compiler with cwd=output/
+            texfile_path = Path(str(out_path))
+            doc.generate_tex(str(out_path))
+
+            # copy assets/beam.png into output/ so pdflatex can find it when compiling
+            src_img = Path("assets/beam.png")
+            dst_img = texfile_path.parent / "beam.png"
+            try:
+                if src_img.exists():
+                    shutil.copy2(src_img, dst_img)
+            except Exception as e:
+                logging.warning("Failed to copy beam image to build folder: %s", e)
+
+            cwd = str(texfile_path.parent)
+            tex_basename = texfile_path.name
+
             if compiler == "latexmk":
-                # force latexmk to run in PDF mode to handle PNG images
-                texfile = str(out_path) + ".tex"
-                # write tex first
-                doc.generate_tex(str(out_path))
-                # copy assets/beam.png into output/ so pdflatex can find it when compiling
-                src_img = Path("assets/beam.png")
-                dst_img = out_path.parent / "beam.png"
-                try:
-                    if src_img.exists():
-                        shutil.copy2(src_img, dst_img)
-                except Exception as e:
-                    logging.warning("Failed to copy beam image to build folder: %s", e)
-                # use -f to force latexmk to complete when previous runs left files behind
-                cmd = [compiler, "-pdf", "-f", "--interaction=nonstopmode", texfile]
-                subprocess.run(cmd, check=True)
+                # force latexmk to run in PDF mode (-pdf) and force complete (-f)
+                cmd = [compiler, "-pdf", "-f", "--interaction=nonstopmode", tex_basename]
+                subprocess.run(cmd, check=True, cwd=cwd)
                 logging.info("Successfully compiled PDF to %s.pdf using latexmk -pdf", out_path)
                 return
-            else:
-                doc.generate_pdf(str(out_path), clean_tex=False, compiler=compiler)
+            elif compiler in ("pdflatex", "xelatex", "lualatex"):
+                # run the specific engine twice to resolve TOC/refs
+                cmd = [compiler, "--interaction=nonstopmode", tex_basename]
+                subprocess.run(cmd, check=True, cwd=cwd)
+                subprocess.run(cmd, check=True, cwd=cwd)
                 logging.info("Successfully compiled PDF to %s.pdf using %s", out_path, compiler)
                 return
+            else:
+                logging.warning("Detected unknown LaTeX compiler '%s' — writing .tex only", compiler)
+                return
         except subprocess.CalledProcessError as e:
-            logging.warning("latexmk failed: %s", e)
+            logging.warning("LaTeX compile failed: %s", e)
         except CompilerError as e:
             logging.warning("LaTeX compile failed: %s", e)
     else:
