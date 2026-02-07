@@ -27,42 +27,40 @@ def ensure_dirs():
 
 
 def read_forces(excel_path="data/forces.xlsx"):
-    # Read Excel and try to detect position and magnitude columns.
+    # Read Excel that already contains precomputed results.
+    # Expected columns (case-insensitive): 'X', 'Shear force', 'Bending Moment'
     try:
         df = pd.read_excel(excel_path)
     except Exception as e:
         raise FileNotFoundError(f"Could not read Excel file at '{excel_path}': {e}")
-    cols = [c.lower() for c in df.columns]
-    # heuristics
-    pos_candidates = [c for c in cols if any(k in c for k in ("pos", "x", "dist", "location", "a"))]
-    mag_candidates = [c for c in cols if any(k in c for k in ("load", "force", "p", "w", "magnitude"))]
-    if pos_candidates and mag_candidates:
-        pos_col = df.columns[cols.index(pos_candidates[0])]
-        mag_col = df.columns[cols.index(mag_candidates[0])]
-    else:
-        # fallback to first two columns
-        pos_col = df.columns[0]
-        mag_col = df.columns[1]
-    forces = df[[pos_col, mag_col]].copy()
-    forces.columns = ["pos", "mag"]
-    # ensure numeric
-    forces = forces.dropna()
+    # map columns by lowercase for robustness
+    col_map = {c.lower(): c for c in df.columns}
+    required = {"x": None, "shear force": None, "bending moment": None}
+    for key in list(required.keys()):
+        if key in col_map:
+            required[key] = col_map[key]
+    if None in required.values():
+        raise ValueError("Excel must contain columns: 'X', 'Shear force', 'Bending Moment' (case-insensitive).")
+
+    data = df[[required['x'], required['shear force'], required['bending moment']]].copy()
+    data.columns = ['X', 'Shear', 'Moment']
+    data = data.dropna()
     try:
-        forces["pos"] = forces["pos"].astype(float)
-        forces["mag"] = forces["mag"].astype(float)
+        data['X'] = data['X'].astype(float)
+        data['Shear'] = data['Shear'].astype(float)
+        data['Moment'] = data['Moment'].astype(float)
     except Exception:
-        raise ValueError("Position and magnitude columns must be numeric.")
-    # convention: positive downward loads (keeps signs consistent)
-    return forces.sort_values("pos").reset_index(drop=True)
+        raise ValueError("Columns 'X', 'Shear force', and 'Bending Moment' must be numeric.")
+    return data.sort_values('X').reset_index(drop=True)
 
 
 def validate_forces(forces: pd.DataFrame):
     if forces.empty:
-        raise ValueError("No force data found in the Excel file.")
-    if (forces["pos"] < 0).any():
-        raise ValueError("All positions must be non-negative.")
-    if (forces["mag"].isnull()).any():
-        raise ValueError("Some load magnitudes are missing.")
+        raise ValueError("No data found in the Excel file.")
+    if (forces['X'] < 0).any():
+        raise ValueError("All X positions must be non-negative.")
+    if forces[['Shear', 'Moment']].isnull().any().any():
+        raise ValueError("Some Shear or Moment values are missing.")
 
 
 def compute_reactions(forces: pd.DataFrame, L: float):
@@ -103,7 +101,7 @@ def pgfplots_coordinates(x, y):
     return "\n            ".join(pairs)
 
 
-def make_document(forces: pd.DataFrame, L: float, RA: float, RB: float, x, shear, moment):
+def make_document(forces: pd.DataFrame, x, shear, moment):
     geometry_options = {"margin": "1in"}
     doc = Document("report", geometry_options=geometry_options)
     # ensure LaTeX can find images when compiling from output/ by adding
@@ -147,20 +145,17 @@ def make_document(forces: pd.DataFrame, L: float, RA: float, RB: float, x, shear
     with doc.create(Section("Input Data")):
         # create a LaTeX table from the dataframe using booktabs
         # place the table inline (non-floating) so it appears immediately after the heading
-        doc.append(NoEscape("\\captionof{table}{Point loads read from Excel (position in m, load in N)}"))
-        with doc.create(Tabular("lr")) as table:
+        doc.append(NoEscape("\\captionof{table}{Input data read from Excel (X, Shear, Bending Moment)}"))
+        with doc.create(Tabular("lrr")) as table:
             table.append(NoEscape("\\toprule"))
-            table.add_row((NoEscape("\\textbf{Position (m)}"), NoEscape("\\textbf{Load (N)}")))
+            table.add_row((NoEscape("\\textbf{X (m)}"), NoEscape("\\textbf{Shear (N)}"), NoEscape("\\textbf{Moment (N\\,m)}")))
             table.append(NoEscape("\\midrule"))
             for _, row in forces.iterrows():
-                table.add_row((f"{row['pos']:.3f}", f"{row['mag']:.3f}"))
+                table.add_row((f"{row['X']:.3f}", f"{row['Shear']:.3f}", f"{row['Moment']:.3f}"))
             table.append(NoEscape("\\bottomrule"))
 
     with doc.create(Section("Analysis")):
-        with doc.create(Subsection("Support Reactions")):
-            # present reactions using math formatting
-            doc.append(NoEscape(rf"Reaction at A (x=0): $R_A = {RA:.3f}\ \mathrm{{N}}$\\"))
-            doc.append(NoEscape(rf"Reaction at B (x=L): $R_B = {RB:.3f}\ \mathrm{{N}}$\\"))
+        doc.append("The following diagrams are generated directly from the provided Excel data. Reactions and load inference were not computed; the supplied SFD and BMD are used as-is.")
 
         with doc.create(Subsection("Shear Force Diagram (SFD)")):
             # generate pgfplots code for shear
@@ -246,17 +241,15 @@ def main():
     try:
         validate_forces(forces)
     except Exception as e:
-        logging.error("Invalid force data: %s", e)
+        logging.error("Invalid input data: %s", e)
         raise
-    # Beam length: use max position or a fixed value if user provides none.
-    L = max(forces["pos"].max() * 1.2, forces["pos"].max() + 1.0) if not forces.empty else 10.0
-    # simple choice: set L as either last load position plus margin
-    L = float(L)
 
-    RA, RB = compute_reactions(forces, L)
-    x, shear, moment = sample_sfd_bmd(forces, L, RA, num=401)
+    # Use provided X, Shear and Moment directly (do not recompute)
+    x = forces['X'].to_numpy()
+    shear = forces['Shear'].to_numpy()
+    moment = forces['Moment'].to_numpy()
 
-    doc = make_document(forces, L, RA, RB, x, shear, moment)
+    doc = make_document(forces, x, shear, moment)
     # Compile to PDF in output/
     out_path = Path("output/report")
     # Try to compile to PDF. If a LaTeX compiler is not available, fall back
